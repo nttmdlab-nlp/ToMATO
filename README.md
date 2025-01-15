@@ -3,8 +3,8 @@ This is the official repository of our paper: **"ToMATO: Verbalizing the Mental 
 
 ![overview](overview.png)
 
-ToMATO is a new benchmark for evaluating Theory of Mind in LLMs.<br>
-ToMATO comprehensively evaluates Theory of Mind in a setting that better aligns with real-world scenarios compared to existing datasets.<br>
+ToMATO is a new benchmark for evaluating Theory of Mind in LLMs.
+ToMATO comprehensively evaluates Theory of Mind in a setting that better aligns with real-world scenarios compared to existing datasets.
 ToMATO was generated through newly designed LLM-LLM conversations with information asymmetry, as illustrated above.
 
 Please cite our work if you find the dataset or codes in this repository useful.
@@ -18,11 +18,11 @@ Please cite our work if you find the dataset or codes in this repository useful.
 }
 ```
 
-**Repository Contents and Licenses**
+## Repository Contents and Licenses
 - `dataset/`: ToMATO benchmark presented in our paper
-  - META LLAMA 3 COMMUNITY LICENSE
+  - License: META LLAMA 3 COMMUNITY LICENSE
 - `code/`: Codes necessary for reproducing our work
-  - NTT License
+  - License: NTT License
 
 ## Intended Use of Data
 Please use the ToMATO benchmark only for evaluation purposes. To avoid test set contamination, please do not use ToMATO for fine-tuning any models.
