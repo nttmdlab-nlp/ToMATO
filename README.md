@@ -1,5 +1,5 @@
 # 🍅 ToMATO
-This is the official repository of our paper: **"ToMATO: Verbalizing the Mental States of Role-Playing LLMs for Benchmarking Theory of Mind"**
+This is the official repository of our paper: **["ToMATO: Verbalizing the Mental States of Role-Playing LLMs for Benchmarking Theory of Mind"](https://arxiv.org/abs/2501.08838)**
 
 ![overview](overview.png)
 
