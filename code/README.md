@@ -17,9 +17,45 @@ pip install -r requirements.txt
 
 ## Generate ToMATO
 ### 0. Download SOTOPIA dataset
-Please first download SOTOPIA environments, agents, and combo from [this url](https://github.com/sotopia-lab/sotopia).
+Please first download SOTOPIA environments, agents, and combo following [this url](https://github.com/sotopia-lab/sotopia).
 
-Then, put them under `./sotopia/` folder.
+First, set up a virtual environment for loading SOTOPIA following [this URL](https://docs.sotopia.world/#installation).
+Second, follow the instructions in [this URL](https://github.com/sotopia-lab/sotopia/issues/7#issuecomment-1806365778) to get the raw SOTOPIA dataset and launch a docker container.
+Then, convert the raw data into json formats as follows, while launching the docker container.
+
+```
+from sotopia.database.persistent_profile import AgentProfile, EnvironmentProfile
+from sotopia.database.env_agent_combo_storage import EnvAgentComboStorage
+
+def save_json(data, file):
+    with open(file, 'w') as f:
+        json.dump(data, f, indent=4)
+
+agent_pks = AgentProfile.all_pks()
+agent_pks = list(agent_pks)
+agents = []
+for pk in agent_pks:
+    agents.append(AgentProfile.get(pk=pk))
+output_agents = [a.__dict__ for a in agents]
+save_json(output_agents, './data/sotopia/agent.json')
+
+environment_pks = EnvironmentProfile.all_pks()
+environment_pks = list(environment_pks)
+print(len(environment_pks))
+environments = []
+for pk in environment_pks:
+    environments.append(EnvironmentProfile.get(pk=pk))
+output_environments = [e.__dict__ for e in environments]
+save_json(output_environments, './data/sotopia/environment.json')
+
+all_combos = EnvAgentComboStorage().all_pks()
+all_combos = list(all_combos)
+combos = []
+for combo in all_combos:
+    combos.append(EnvAgentComboStorage().get(combo))
+output_combos = [c.__dict__ for c in combos]
+save_json(output_combos, './data/sotopia/combo.json')
+```
 
 ### 1. Generate System Prompts
 ```
