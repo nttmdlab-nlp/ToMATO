@@ -17,8 +17,6 @@ pip install -r requirements.txt
 
 ## Generate ToMATO
 ### 0. Download SOTOPIA dataset
-Please first download SOTOPIA environments, agents, and combo following [this url](https://github.com/sotopia-lab/sotopia).
-
 First, set up a virtual environment for loading SOTOPIA following [this URL](https://docs.sotopia.world/#installation).
 Second, follow the instructions in [this URL](https://github.com/sotopia-lab/sotopia/issues/7#issuecomment-1806365778) to get the raw SOTOPIA dataset and launch a docker container.
 Then, convert the raw data into json formats as follows, while launching the docker container.
