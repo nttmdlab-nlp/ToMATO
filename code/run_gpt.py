@@ -114,11 +114,13 @@ def main():
             if 'scenario_id' in qa:
                 result['scenario_id'] = qa['scenario_id']
 
+            transcripts = qa['transcript']
             system_prompt = \
-                "You are an expert at answering questions. " \
-                "Please choose the most probable answer to the following question from the options. " \
+                "You are an expert at understanding human communication. " \
+                "Please leverage the information provided and choose the most probable answer to the following question from the options. " \
                 "Output your final verdict by strictly following this format: [A], [B], [C], or [D]"
-            instruction = "# Question\n" + q + "\n\n"
+            instruction = "# Transcripts\n" + transcripts + "\n" \
+                "# Question\n" + q + "\n\n"
 
             if num_options >= 1:
                 instruction += "# Options\n[A] " + qa['a0']
