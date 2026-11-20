@@ -21,10 +21,7 @@ def load_model_hf(model_path, load_8bit, load_4bit, load_bf16, device='auto'):
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, padding_side='left')
     tokenizer.pad_token = tokenizer.eos_token
-    if 'google/flan-t5' in model_path:
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+    model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
     return model, tokenizer
 
 

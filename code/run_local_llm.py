@@ -1,394 +1,292 @@
-import os
-import re
-import json
-import random
-import datetime
-import base64
-import time
-import requests
-import traceback
 import argparse
-from collections import defaultdict
-
-import numpy as np
-import torch
-from torch.nn import CrossEntropyLoss
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    HfArgumentParser,
-    TrainingArguments,
-    pipeline,
-    logging,
-)
-from peft import (
-    prepare_model_for_kbit_training,
-    LoraConfig,
-    PeftModel,
-    PeftConfig,
-    get_peft_model
-)
-from datasets import Dataset, load_dataset
-
+import json
+import logging
+import re
 from pathlib import Path
-from tqdm import tqdm
+from vllm import LLM, SamplingParams
 
-from src.utils import load_json, save_json, mental_verb
-from src.nn import load_model_hf
 from prompts import cot_prompts
 
 
-idx_to_option = {
-    0: "A",
-    1: "B",
-    2: "C",
-    3: "D",
-}
-
-data_to_num_options = {
-    'tomato': 4,
-    'siqa': 3
-}
-
-sotopia_agent = {a['pk']: a for a in load_json('data/sotopia/agent.json')}
-sotopia_combo = {a['pk'][-5:]: a for a in load_json('data/sotopia/combo.json')}
-sotopia_environment = {a['pk']: a for a in load_json('data/sotopia/environment.json')}
+LOGGER = logging.getLogger(__name__)
+DATA_TO_NUM_OPTIONS = {"tomato": 4, "siqa": 3}
+OPTIONS = "ABCD"
+DATASET_DIR = Path(__file__).resolve().parents[1] / "dataset"
 
 
-def ArgParser():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--method", default="", type=str)
-    parser.add_argument("--data_type", default="siq", type=str, help="")
-    parser.add_argument("--test_files", default=[], nargs='*', type=str, help="")
-    parser.add_argument("--exclude_options_from_prompt", default=False, action="store_true", help="")
-    parser.add_argument("--cot_prompt", default=None, type=str)
-    parser.add_argument("--output_dir", default="output", type=str, help="")
-    parser.add_argument("--output_suffix", default="", type=str, help="")
-    parser.add_argument("--do_gen_qa", default=False, action="store_true", help="")
-    parser.add_argument("--do_mc_qa", default=False, action="store_true", help="")
-    parser.add_argument("--do_sample", default=False, action="store_true", help="")
-    parser.add_argument("--top_p", default=0.9, type=float, help="")
-    parser.add_argument("--temperature", default=0.6, type=float, help="")
-    parser.add_argument("--exp_id", default="default", type=str)
-    parser.add_argument("--save_steps", default=500, type=int, help="")
-    parser.add_argument("--log_steps", default=100, type=int, help="")
-    parser.add_argument("--debug", default=False, action="store_true", help="")
-    parser.add_argument("--eval_batch_size", default=8, type=int, help="")
-    parser.add_argument("--model_path", default="", type=str)
-    parser.add_argument("--overwrite", default=False, action="store_true", help="")
-    parser.add_argument("--seed", default=42, type=int, help="")
-    parser.add_argument("--load_8bit", default=False, action="store_true", help="")
-    parser.add_argument("--load_4bit", default=False, action="store_true", help="")
-    parser.add_argument("--load_bf16", default=False, action="store_true", help="")
-    args = parser.parse_args()
-    print(args)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Evaluate local chat models with vLLM offline inference.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--model_path", required=True)
+    parser.add_argument("--test_files", nargs="+", type=Path, required=True)
+    parser.add_argument("--data_type", choices=DATA_TO_NUM_OPTIONS, default="tomato")
+    parser.add_argument("--torch_dtype", default="auto", choices=(
+        "auto", "float16", "bfloat16", "float32",
+    ), help="Passed to vLLM as dtype; quantization is a separate setting.")
+    parser.add_argument("--quantization", default=None,
+                        help="vLLM quantization method, e.g. awq or gptq; auto-detected if omitted.")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=None)
+    parser.add_argument("--max_num_seqs", type=int, default=256,
+                        help="Maximum concurrent sequences scheduled by vLLM.")
+    parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--disable_system_prompt", "--do_disable_system_prompt",
+                        action="store_true",
+                        help="Merge instructions into the user message for templates without system roles.")
+    parser.add_argument("--exclude_options_from_prompt", action="store_true")
+    parser.add_argument("--cot_prompt", choices=cot_prompts, default=None)
+    parser.add_argument("--do_gen_qa", action="store_true",
+                        help="Compatibility flag; generation-based evaluation is always enabled.")
+    parser.add_argument("--do_mc_qa", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=Path, default=Path("output"))
+    parser.add_argument("--exp_id", default="default")
+    parser.add_argument("--output_suffix", default="")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--debug", action="store_true", help="Evaluate only the first 8 examples.")
+    args = parser.parse_args(argv)
+    if args.do_mc_qa:
+        parser.error("--do_mc_qa is no longer supported; use generation-based evaluation (--do_gen_qa).")
+    for name in ("tensor_parallel_size", "max_num_seqs", "max_new_tokens"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    if args.max_model_len is not None and args.max_model_len <= 0:
+        parser.error("--max_model_len must be positive")
+    if not 0 < args.gpu_memory_utilization < 1:
+        parser.error("--gpu_memory_utilization must be between 0 and 1")
+    if not 0 < args.top_p <= 1:
+        parser.error("--top_p must be in (0, 1]")
+    if not 0 <= args.temperature < float("inf"):
+        parser.error("--temperature must be finite and nonnegative")
     return args
 
 
-def set_seed(seed):
-    rnd = random.Random()
-    rnd.seed(seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    return rnd
-
-
-def get_model(model_path, load_8bit, load_4bit, load_bf16):
-    device = 'cuda'
-    if (Path(model_path) / 'adapter_config.json').exists():
-        load_adapter = True
-    else:
-        load_adapter = False
-
-    if load_adapter:
-        print(datetime.datetime.now(), f'Loading Peft Model from {model_path} ...')
-        peft_config = PeftConfig.from_pretrained(model_path)
-        model, tokenizer = load_model_hf(peft_config.base_model_name_or_path, load_8bit, load_4bit, load_bf16, device=device)
-        model = PeftModel.from_pretrained(model, model_path, device_map=device)
-        processor = context_len = None
-    else:
-        print(datetime.datetime.now(), f'Loading Huggingface Model from {model_path} ...')
-        model, tokenizer = load_model_hf(model_path, load_8bit, load_4bit, load_bf16, device=device)
-        processor = context_len = None
-    return tokenizer, model, processor, context_len
-
-
-def compute_clm_loss(logits, labels, reduction, pad_id=0):
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    # Flatten the tokens
-    vocab_size = logits.size(-1)
-    loss_fct = CrossEntropyLoss(reduction=reduction)
-    shift_logits = shift_logits.view(-1, vocab_size)
-    shift_labels = shift_labels.view(-1)
-    # Enable model/pipeline parallelism
-    shift_labels = shift_labels.to(shift_logits.device)
-    loss = loss_fct(shift_logits, shift_labels)
-    loss = loss * (shift_labels != pad_id)
-    return loss
-
-
-def generate_prompt_qa(
-        args,
-        b,
-        num_options,
-        tokenizer,
-        qa_mode='mcqa',
-        append_option=False,
-        option_j=None):
-    assert qa_mode in ['mcqa', 'genqa']
-    context_name = 'Transcript' if args.data_type != 'siqa' else 'Context'
-    inp = ''
-    inp += f'# {context_name} \n' + b['transcript'] + '\n\n'
-    inp += '# Question \n' + b['q']
+def build_messages(args, example):
+    context_name = "Context" if args.data_type == "siqa" else "Conversation"
+    content = f"# {context_name}\n{example['conversation']}\n\n# Question\n{example['q']}"
+    instruction = "You are an expert at understanding human communication. "
     if args.exclude_options_from_prompt:
-        if append_option:
-            opt = b[f'a{option_j}']
-        system_prompt = 'You are an expert at understanding human communication. ' \
-            'Please leverage the information provided and generate an answer in one sentence to the question.'
+        instruction += (
+            "Please leverage the information provided and generate an answer "
+            "in one sentence to the question."
+        )
     else:
-        inp += '\n\n' + '# Options \n'
-        inp += '[A] ' + b['a0'] + '\n'
-        if num_options >= 2:
-            inp += '[B] ' + b['a1'] + '\n'
-        if num_options >= 3:
-            inp += '[C] ' + b['a2'] + '\n'
-        if num_options >= 4:
-            inp += '[D] ' + b['a3'] + '\n'
-        if num_options >= 5:
-            raise NotImplementedError(f'`num_options = {num_options}` is not supported yet')
-        if append_option:
-            opt = '[' + idx_to_option[option_j] + ']'
-        system_prompt = 'You are an expert at understanding human communication. ' \
-            'Please leverage the information provided and choose the most probable answer to the question from the options. ' \
-            'Output your final answer by strictly following this format: [A], [B], [C], or [D]'
-    if args.do_disable_system_prompt:
-        # For llms that do not support system prompts, such as Mistral
-        chat = [
-            {"role": "user", "content": system_prompt + '\n\n' + inp}
-        ]
-    else:
-        chat = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": inp}
-        ]
-    if qa_mode == 'mcqa' and append_option: # for evaluation
-        chat.append({"role": "assistant", "content": opt})
-    if qa_mode == 'genqa' and args.cot_prompt is not None:
-        res_prefix = cot_prompts[args.cot_prompt]
-        chat.append({"role": "assistant", "content": res_prefix})
-    if not 'google/flan-t5' in args.model_path:
-        if 'gemma' in args.model_path:
-            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=args.cot_prompt is None)
+        labels = OPTIONS[:DATA_TO_NUM_OPTIONS[args.data_type]]
+        choices = "\n".join(
+            f"[{label}] {example[f'a{index}']}" for index, label in enumerate(labels)
+        )
+        content += f"\n\n# Options\n{choices}"
+        if args.cot_prompt is not None:
+            instruction += (
+                "Please leverage the information provided and choose the most probable "
+                "answer to the question from the options: " + ", ".join(f"[{label}]" for label in labels) + ". "
+                "Reason step by step before outputting your final answer. "
+                "After providing your explanation, output your final verdict by strictly following this format: "
+                "[[A]] if A is better, [[B]] if B is better, [[C]] if C is better, and [[D]] if D is better."
+            )
         else:
-            prompt = tokenizer.apply_chat_template(chat, tokenize=False)
+            instruction += (
+                "Please leverage the information provided and choose the most probable "
+                "answer to the question from the options. Output your final answer by "
+                "strictly following this format: [[A]] if A is better, [[B]] if B is better, [[C]] if C is better, and [[D]] if D is better."
+            )
+    if args.cot_prompt is not None:
+        content += "\n\n" + cot_prompts[args.cot_prompt]
+    if args.disable_system_prompt:
+        return [{"role": "user", "content": instruction + "\n\n" + content}]
+    return [
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": content},
+    ]
+
+
+def extract_answer(text, num_options):
+    matches = re.findall(r"\[\[([" + OPTIONS[:num_options] + r"])\]\]", text)
+    return matches[-1] if matches else ""
+
+
+def load_examples(path, args):
+    with path.open(encoding="utf-8") as handle:
+        examples = json.load(handle)
+    if not isinstance(examples, list) or not examples:
+        raise ValueError(f"{path}: expected a nonempty JSON list of examples")
+    if args.debug:
+        examples = examples[:8]
+    seen = set()
+    num_options = DATA_TO_NUM_OPTIONS[args.data_type]
+    required = {"q_id", "conversation", "q", "a_str", "a_idx"}
+    if not args.exclude_options_from_prompt:
+        required.update(f"a{index}" for index in range(num_options))
+    for index, example in enumerate(examples):
+        if not isinstance(example, dict) or not required.issubset(example):
+            raise ValueError(f"{path}: example {index} is missing required fields: {sorted(required)}")
+        question_id = example["q_id"]
+        if not isinstance(question_id, str) or not question_id or question_id in seen:
+            raise ValueError(f"{path}: invalid or duplicate q_id: {question_id!r}")
+        seen.add(question_id)
+        if type(example["a_idx"]) is not int or not 0 <= example["a_idx"] < num_options:
+            raise ValueError(f"{path}: invalid a_idx for {question_id}")
+    return examples
+
+
+def create_engine(args):
+    options = {
+        "model": args.model_path,
+        "dtype": args.torch_dtype,
+        "quantization": args.quantization,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_seqs": args.max_num_seqs,
+        "trust_remote_code": args.trust_remote_code,
+        "seed": args.seed,
+    }
+    if args.max_model_len is not None:
+        options["max_model_len"] = args.max_model_len
+    return LLM(**options)
+
+
+def create_sampling_params(args):
+    return SamplingParams(
+        temperature=args.temperature if args.do_sample else 0.0,
+        top_p=args.top_p if args.do_sample else 1.0,
+        max_tokens=args.max_new_tokens,
+        seed=args.seed,
+    )
+
+
+def evaluate(args, engine, sampling_params, examples, output_file):
+    conversations = [build_messages(args, example) for example in examples]
+    outputs = engine.chat(conversations, sampling_params=sampling_params, use_tqdm=True)
+    if len(outputs) != len(examples):
+        raise RuntimeError("vLLM returned a different number of outputs than inputs")
+    completions = {
+        example["q_id"]: {
+            "text": output.outputs[0].text,
+            "finish_reason": output.outputs[0].finish_reason,
+        }
+        for example, output in zip(examples, outputs)
+    }
+    return save_results(args, examples, completions, output_file)
+
+
+def summarize_results(results, compute_accuracy):
+    total = len(results)
+    correct = sum(result["a_pred_gen"] == result["a_true"] for result in results)
+    return {
+        "accuracy": correct / total if compute_accuracy and total else None,
+        "correct": correct if compute_accuracy else None,
+        "total": total,
+        "invalid_answers": (sum(not result["a_pred_gen"] for result in results)
+                            if compute_accuracy else None),
+        "length_limited_responses": sum(result["finish_reason"] == "length"
+                                       for result in results),
+    }
+
+
+def save_results(args, examples, completions, output_file):
+    results = {}
+    num_options = DATA_TO_NUM_OPTIONS[args.data_type]
+    correct = invalid = truncated = 0
+    for example in examples:
+        completion = completions[example["q_id"]]
+        answer = extract_answer(completion["text"], num_options)
+        expected = OPTIONS[example["a_idx"]]
+        result = {
+            "q_id": example["q_id"],
+            "a_str": example["a_str"],
+            "a_true": expected,
+            "a_gen": completion["text"],
+            "a_pred_gen": answer,
+            "finish_reason": completion["finish_reason"],
+        }
+        if "scenario_id" in example:
+            result["scenario_id"] = example["scenario_id"]
+        results[example["q_id"]] = result
+        correct += answer == expected
+        invalid += not answer
+        truncated += completion["finish_reason"] == "length"
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file = output_file.with_suffix(output_file.suffix + ".tmp")
+    with temporary_file.open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=4, ensure_ascii=False)
+        handle.write("\n")
+    temporary_file.replace(output_file)
+    compute_accuracy = not args.exclude_options_from_prompt
+    metrics = {
+        "overall": summarize_results(list(results.values()), compute_accuracy),
+        "subsets": {},
+        "mental_states": {},
+    }
+    if args.data_type == "tomato":
+        for subset in ("tomato_fb", "tomato_first", "tomato_second"):
+            with (DATASET_DIR / f"{subset}.json").open(encoding="utf-8") as handle:
+                question_ids = {example["q_id"] for example in json.load(handle)}
+            metrics["subsets"][subset] = summarize_results(
+                [result for question_id, result in results.items() if question_id in question_ids],
+                compute_accuracy,
+            )
+        with (DATASET_DIR / "tomato.json").open(encoding="utf-8") as handle:
+            all_examples = json.load(handle)
+        mental_states = {}
+        for example in all_examples:
+            mental_states.setdefault(example["mental_state"], set()).add(example["q_id"])
+        for mental_state, question_ids in sorted(mental_states.items()):
+            metrics["mental_states"][mental_state] = summarize_results(
+                [result for question_id, result in results.items() if question_id in question_ids],
+                compute_accuracy,
+            )
+    evaluation_file = output_file.parent / "eval_results.json"
+    evaluation_results = {}
+    if evaluation_file.exists():
+        with evaluation_file.open(encoding="utf-8") as handle:
+            evaluation_results = json.load(handle)
+    evaluation_results[output_file.name] = metrics
+    temporary_evaluation_file = evaluation_file.with_suffix(".json.tmp")
+    with temporary_evaluation_file.open("w", encoding="utf-8") as handle:
+        json.dump(evaluation_results, handle, indent=4, ensure_ascii=False)
+        handle.write("\n")
+    temporary_evaluation_file.replace(evaluation_file)
+    LOGGER.info("Saved evaluation metrics: %s", evaluation_file)
+    if args.exclude_options_from_prompt:
+        LOGGER.info("Free-form generation: automatic choice accuracy is not computed.")
     else:
-        # For LLMs Without Multi-Turn Conversation Ability
-        prompt = "\n\n".join([c["content"] for c in chat])
-    if qa_mode == 'genqa' and args.cot_prompt is not None:
-        if 'gemma' in args.model_path:
-            if prompt.endswith("<end_of_turn>\n"):
-                prompt = prompt[:-len("<end_of_turn>\n")].strip()
-        else:
-            if prompt.endswith(tokenizer.eos_token):
-                prompt = prompt[:-len(tokenizer.eos_token)].strip()
-    return prompt
-
-
-def evaluate(args, model, processor, tokenizer, eval_examples, data_name, output_file):
-
-    batch_size = args.eval_batch_size
-    tokenizer.padding_side = "right"
-    tokenizer.truncation_side = "right"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if hasattr(model.config, "max_position_embeddings"):
-        tokenizer.max_length = model.config.max_position_embeddings
-    else:
-        tokenizer.max_length = 8192
-
-    if 'Llama-3' in args.model_path:
-        conv_mode = "llama_3"
-    else:
-        conv_mode = "default"
-    print(datetime.datetime.now(), f'`conv_mode` is set to {conv_mode}')
-
-    n_examples = len(eval_examples)
-    n_batches = n_examples // batch_size + int(n_examples % batch_size != 0)
-    all_outputs = {}
-
-    num_options = data_to_num_options[args.data_type]
-
-    for i in tqdm(range(n_batches)):
-        batch = eval_examples[i*batch_size:(i+1)*batch_size]
-
-        if args.do_mc_qa:
-            lls = []
-            for j in range(num_options): # iterate for num of options
-                inputs_text = []
-                for b in batch:
-                    prompt = generate_prompt_qa(
-                        args, b, num_options, tokenizer, qa_mode='mcqa', append_option=True, option_j=j)
-                    inputs_text.append(prompt)
-
-                inputs = tokenizer(inputs_text, add_special_tokens=False, padding=True, truncation=True, return_tensors='pt')
-                inputs = {k: inputs[k].cuda() for k in inputs}
-                with torch.inference_mode():
-                    outputs = model(**inputs)
-                lls.append(outputs.loss.view(len(batch), -1).sum(1, keepdim=True).cpu())
-            lls = torch.cat(lls, dim=1)
-            if i % args.log_steps == 0:
-                print(datetime.datetime.now())
-                print('Input', json.dumps(batch[0], indent=4))
-                print('Decoded input', tokenizer.decode(inputs['input_ids'][0]))
-                print('Input IDs', inputs['input_ids'][0])
-                print('Output (NLL)', lls[0])
-            for b, ll in zip(batch, lls):
-                ll = ll.cpu().numpy().tolist()
-                all_outputs[b['q_id']] = {
-                    'll': ll,
-                    'pred': idx_to_option[int(np.argmin(ll))]
-                }
-
-        if args.do_gen_qa:
-            if 'Llama-2' in args.model_path:
-                response_template = "[/INST]"
-                tokenizer.padding_side = "left"
-            elif 'Llama-3' in args.model_path:
-                response_template = "<|start_header_id|>assistant<|end_header_id|>"
-                tokenizer.padding_side = "left"
-            elif 'mistralai' in args.model_path:
-                response_template = "[/INST]"
-                tokenizer.padding_side = "left"
-            elif 'flan-t5' in args.model_path:
-                response_template = ""
-                tokenizer.padding_side = "left"
-            elif 'gemma' in args.model_path:
-                response_template = "<start_of_turn>model"
-                tokenizer.padding_side = "left"
-            else:
-                raise NotImplementedError(args.model_path)
-
-            inputs_text = []
-            for b in batch:
-                prompt = generate_prompt_qa(
-                    args, b, num_options, tokenizer, qa_mode='genqa')
-                inputs_text.append(prompt)
-            inputs = tokenizer(inputs_text, add_special_tokens=False, padding=True, truncation=True, return_tensors='pt')
-            inputs = {k: inputs[k].cuda() for k in inputs}
-            inputs["max_new_tokens"] = 256
-            if args.do_sample:
-                inputs["do_sample"] = True
-                inputs["top_p"] = args.top_p
-                inputs["temperature"] = args.temperature
-            with torch.inference_mode():
-                if conv_mode == 'llama_3':
-                    outputs = model.generate(
-                        **inputs,
-                        eos_token_id=[
-                            tokenizer.eos_token_id,
-                            tokenizer.convert_tokens_to_ids("<|eot_id|>")
-                        ],
-                        pad_token_id=tokenizer.eos_token_id
-                    )
-                else:
-                    outputs = model.generate(**inputs)
-            decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=False)
-            if i % args.log_steps == 0:
-                print(datetime.datetime.now())
-                print('Input', json.dumps(batch[0], indent=4))
-                print('Decoded input', tokenizer.decode(inputs['input_ids'][0]))
-                print('Input IDs', inputs['input_ids'][0])
-                print('Decoded output', decoded_outputs[0])
-            for b, o in zip(batch, decoded_outputs):
-                if not b['q_id'] in all_outputs:
-                    all_outputs[b['q_id']] = {}
-                if response_template != "":
-                    o = o.split(response_template)[-1].strip()
-                all_outputs[b['q_id']]['gen'] = o
-
-    if output_file.exists():
-        results = load_json(output_file)
-        print(datetime.datetime.now(), f'{str(output_file)} is loaded, and will be overwritten.')
-    else:
-        results = {}
-    true_or_false = []
-    true_or_false_gen = []
-    for e in eval_examples:
-        q_id = e['q_id']
-        a_corr = e['a_str']
-        a_idx = e['a_idx']
-        if q_id in results:
-            result = results[q_id]
-        else:
-            result = {}
-        result['q_id'] = q_id
-        result['a_str'] = a_corr
-        result['a_true'] = idx_to_option[a_idx]
-        if 'pred' in all_outputs[q_id]:
-            result['a_pred'] = all_outputs[q_id]['pred']
-            true_or_false.append(idx_to_option[a_idx] == all_outputs[q_id]['pred'])
-        if 'll' in all_outputs[q_id]:
-            result['a_score'] = all_outputs[q_id]['ll']
-        if 'gen' in all_outputs[q_id]:
-            result['a_gen'] = all_outputs[q_id]['gen']
-            a_pred_gen = re.search(r'\[[A,B,C,D]\]', all_outputs[q_id]['gen'])
-            if a_pred_gen is not None:
-                start, end = a_pred_gen.span()
-                a_pred_gen = all_outputs[q_id]['gen'][start:end][1]
-            else:
-                a_pred_gen = ''
-            result['a_pred_gen'] = a_pred_gen
-            true_or_false_gen.append(idx_to_option[a_idx] == a_pred_gen)
-        if 'scenario_id' in e:
-            result['scenario_id'] = e['scenario_id']
-        results[q_id] = result
-    if args.do_mc_qa:
-        acc = float(np.mean(true_or_false))
-        print('Accuracy:', acc)
-    if args.do_gen_qa:
-        acc = float(np.mean(true_or_false_gen))
-        print('Accuracy:', acc)
-    save_json(results, output_file)
-    print(datetime.datetime.now(), f'Saved {str(output_file)}.')
+        LOGGER.info("Accuracy: %.4f (%d/%d); invalid answers: %d",
+                    correct / len(examples), correct, len(examples), invalid)
+    LOGGER.info("Length-limited responses: %d; saved %s", truncated, output_file)
     return results
 
 
-def main():
-    args = ArgParser()
-
-    rnd = set_seed(args.seed)
-    args.rnd = rnd
-
-    # Disable system prompt for some llms
-    args.do_disable_system_prompt = ('mistralai' in args.model_path or 'gemma' in args.model_path)
-
-    output_dir = Path(args.output_dir) / args.exp_id
-    output_dir.mkdir(parents=True, exist_ok=True)    
-
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args(argv)
+    output_dir = args.output_dir / args.exp_id
+    jobs = []
+    output_paths = set()
     for test_file in args.test_files:
-        data_name = args.data_type + '_' + Path(test_file).stem # used for output file name
-        output_name = f'predictions_on_{data_name}_{args.output_suffix}.json'
-        output_file = output_dir / output_name
-        if output_file.exists():
-            print(datetime.datetime.now(), f'[WARNING] {str(output_file)} already exists.')
-            if not args.overwrite:
-                return None
-        else:
-            save_json({'CreatedAt': str(datetime.datetime.now())}, output_file)
-        eval_examples = load_json(test_file)
-
-        ## Load Model
-        tokenizer, model, processor, context_len = get_model(
-            args.model_path, args.load_8bit, args.load_4bit, args.load_bf16)
-        model.config.use_cache = True
-
-        if args.debug:
-            eval_examples = eval_examples[:8]
-        print(datetime.datetime.now(), f'{len(eval_examples)} examples will be evaluated.')
-        results = evaluate(args, model, processor, tokenizer, eval_examples, data_name, output_file)
+        output_file = output_dir / f"predictions_on_{test_file.stem}_{args.output_suffix}.json"
+        if output_file in output_paths:
+            raise ValueError(f"Multiple test files map to the same output: {output_file}")
+        output_paths.add(output_file)
+        if output_file.exists() and not args.overwrite:
+            LOGGER.info("Skipping existing output: %s", output_file)
+            continue
+        jobs.append((load_examples(test_file, args), output_file))
+    if not jobs:
+        return
+    engine = create_engine(args)
+    sampling_params = create_sampling_params(args)
+    for examples, output_file in jobs:
+        LOGGER.info("Evaluating %d examples -> %s", len(examples), output_file)
+        evaluate(args, engine, sampling_params, examples, output_file)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
